@@ -254,6 +254,7 @@ def root():
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
         "docs": "/docs",
+        "ui": "/ui",
         "developer": "@kzr0x | channel @api_wallah",
     }
 
@@ -399,5 +400,6 @@ def _build_ui():
     return demo
 
 
+# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
 demo = _build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
