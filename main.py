@@ -25,6 +25,10 @@ THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 
+# ✅ YOUR CREDITS
+DEVELOPER = "@Cosmos_ownerr"
+CHANNEL = "@cosmosxinfo"
+
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
@@ -35,6 +39,15 @@ REMOTE_INDEXES = {
     "phone":  [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet"  for i in range(7)],
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
 }
+
+
+# ── Credits block ───────────────────────────────────────────────────────────
+def _credit_block() -> dict:
+    return {
+        "developer": DEVELOPER,
+        "channel": CHANNEL,
+    }
+
 
 # ── In-memory cache ─────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
@@ -55,7 +68,7 @@ def _cache_set(key: str, value: dict):
         _cache[key] = value
 
 
-# ── Rate limiter ────────────────────────────────────────────────────────────
+# ── Rate limiter (per IP) ───────────────────────────────────────────────────
 _hits: dict[str, list[float]] = defaultdict(list)
 _hits_lock = threading.Lock()
 
@@ -255,7 +268,7 @@ def root():
         "rate_limit_per_min": RATE_LIMIT_PER_MIN,
         "docs": "/docs",
         "ui": "/ui",
-        "developer": "@kzr0x | channel @api_wallah",
+        **_credit_block(),
     }
 
 
@@ -266,6 +279,7 @@ def health():
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "cache_size": len(_cache),
         "hf_token": bool(HF_TOKEN),
+        **_credit_block(),
     }
 
 
@@ -279,6 +293,8 @@ async def search(
     limit: int = Query(10, ge=1, le=100),
     pretty: bool = Query(True),
 ):
+    t_start = time()
+
     ip = request.client.host if request.client else "unknown"
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
@@ -293,13 +309,24 @@ async def search(
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
 
-    result = {"success": bool(data["count"]), **data, "number": q_val, "total": data["count"]}
+    elapsed = f"{round(time() - t_start, 1)} seconds"
+
+    result = {
+        "success": bool(data["count"]),
+        "response_time": elapsed,
+        **data,
+        "number": q_val,
+        "total": data["count"],
+        **_credit_block(),
+    }
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
 
 @fastapi_app.post("/search/parallel")
 async def search_parallel(request: Request, req: BatchRequest):
+    t_start = time()
+
     ip = request.client.host if request.client else "unknown"
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
@@ -320,9 +347,16 @@ async def search_parallel(request: Request, req: BatchRequest):
         for item in req.queries
     ]
     results = await asyncio.gather(*tasks)
+
+    elapsed = f"{round(time() - t_start, 1)} seconds"
+
     return Response(
-        content=json.dumps({"searches": len(req.queries), "results": list(results)},
-                           indent=2, ensure_ascii=False),
+        content=json.dumps({
+            "searches": len(req.queries),
+            "response_time": elapsed,
+            "results": list(results),
+            **_credit_block(),
+        }, indent=2, ensure_ascii=False),
         media_type="application/json",
     )
 
@@ -366,25 +400,36 @@ def _search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
         return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
     q = query.strip()
+    t_start = time()
     try:
         data = _unified_search(q, int(limit))
     except Exception as e:
         return f"❌ Error: {str(e)}"
+    elapsed = f"{round(time() - t_start, 1)} seconds"
 
     count = data["count"]
     results = data["results"]
     searched = ", ".join(data.get("searched_fields", []))
 
     if not results:
-        return f"🔍 **Query:** `{q}`\n**Searched:** {searched}\n\n❌ **No data found**."
+        return (
+            f"🔍 **Query:** `{q}`\n"
+            f"**Searched:** {searched}\n"
+            f"⏱️ **Response:** {elapsed}\n\n"
+            f"❌ **No data found**."
+        )
 
-    header = f"🔍 **Query:** `{q}`  |  **Found:** {count}  |  **Searched:** {searched}\n\n---\n\n"
+    header = (
+        f"🔍 **Query:** `{q}`  |  **Found:** {count}  |  **Searched:** {searched}\n"
+        f"⏱️ **Response:** {elapsed}\n"
+        f"👨‍💻 **Developer:** {DEVELOPER}  |  📢 **Channel:** {CHANNEL}\n\n---\n\n"
+    )
     parts = [f"### Result {i}\n{_format_result(r)}" for i, r in enumerate(results, 1)]
     return header + "\n\n---\n\n".join(parts)
 
 
 def _build_ui():
-    with gr.Blocks(title="ICMR Search API", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Cosmos Search API", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# 🔍 ICMR + HITEK Search API")
         gr.Markdown("Search **2.5 billion records** — phone, Aadhaar, name & more")
         with gr.Row():
@@ -396,10 +441,13 @@ def _build_ui():
         output = gr.Markdown(label="Results")
         search_btn.click(fn=_search_ui, inputs=[query_input, limit_slider], outputs=output)
         query_input.submit(fn=_search_ui, inputs=[query_input, limit_slider], outputs=output)
-        gr.Markdown("---\n<div style='text-align:center'>👨‍💻 @kzr0x | 📢 @api_wallah</div>")
+        gr.Markdown(
+            f"---\n<div style='text-align:center'>"
+            f"👨‍💻 <b>{DEVELOPER}</b>  |  📢 <b>{CHANNEL}</b>"
+            f"</div>"
+        )
     return demo
 
 
-# ── Mount Gradio on FastAPI ─────────────────────────────────────────────────
 demo = _build_ui()
 app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
