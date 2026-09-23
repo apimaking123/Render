@@ -1,3 +1,14 @@
+"""
+ICMR + HITEK Search API
+========================
+A high-performance search API over 2.5 billion Indian citizen records
+(ICMR + HITEK data) using DuckDB reading remote Parquet indexes from
+Hugging Face buckets.
+
+Author : @Cosmos_ownerr
+Channel: @cosmosxinfo
+"""
+
 import asyncio
 import json
 import os
@@ -13,7 +24,10 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  CONFIG
+# ═══════════════════════════════════════════════════════════════════════════
+
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
     "https://huggingface.co/buckets/Apimaking/icrm-hitek-full-db-mixed-bucket-new/resolve",
@@ -41,7 +55,10 @@ REMOTE_INDEXES = {
 }
 
 
-# ── Credits block ───────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  CREDITS
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _credit_block() -> dict:
     return {
         "developer": DEVELOPER,
@@ -49,7 +66,10 @@ def _credit_block() -> dict:
     }
 
 
-# ── In-memory cache ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  IN-MEMORY CACHE
+# ═══════════════════════════════════════════════════════════════════════════
+
 _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 CACHE_MAX = 5000
@@ -68,7 +88,10 @@ def _cache_set(key: str, value: dict):
         _cache[key] = value
 
 
-# ── Rate limiter (per IP) ───────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  RATE LIMITER (per IP, 60s sliding window)
+# ═══════════════════════════════════════════════════════════════════════════
+
 _hits: dict[str, list[float]] = defaultdict(list)
 _hits_lock = threading.Lock()
 
@@ -83,7 +106,10 @@ def _rate_ok(ip: str) -> bool:
         return True
 
 
-# ── DuckDB pool ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  DUCKDB POOL
+# ═══════════════════════════════════════════════════════════════════════════
+
 _conns: list[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
@@ -146,7 +172,10 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ── Dedup ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  DEDUP
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _person_key(row: dict) -> tuple:
     ph = (row.get("phoneNumber") or "").strip()
     ad = (row.get("aadharNumber") or "").strip()
@@ -183,7 +212,10 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
     return out
 
 
-# ── Search ──────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  SEARCH
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
@@ -250,7 +282,10 @@ def _unified_search(q: str, limit: int = 10) -> dict:
     return result
 
 
-# ── FastAPI ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  FASTAPI
+# ═══════════════════════════════════════════════════════════════════════════
+
 fastapi_app = FastAPI(title="ICMR + HITEK Search API")
 
 
@@ -311,14 +346,30 @@ async def search(
 
     elapsed = f"{round(time() - t_start, 1)} seconds"
 
-    result = {
-        "success": bool(data["count"]),
-        "response_time": elapsed,
-        **data,
-        "number": q_val,
-        "total": data["count"],
-        **_credit_block(),
-    }
+    if data["count"] > 0:
+        result = {
+            "success": True,
+            "status": "Data found ✅",
+            "response_time": elapsed,
+            **data,
+            "number": q_val,
+            "total": data["count"],
+            **_credit_block(),
+        }
+    else:
+        result = {
+            "success": False,
+            "status": "Data not available 🙅",
+            "response_time": elapsed,
+            "query": q_val,
+            "number": q_val,
+            "searched_fields": data.get("searched_fields", []),
+            "count": 0,
+            "total": 0,
+            "results": [],
+            **_credit_block(),
+        }
+
     content = json.dumps(result, indent=2 if pretty else None, ensure_ascii=False)
     return Response(content=content, media_type="application/json")
 
@@ -348,6 +399,14 @@ async def search_parallel(request: Request, req: BatchRequest):
     ]
     results = await asyncio.gather(*tasks)
 
+    for r in results:
+        if r.get("count", 0) > 0:
+            r["success"] = True
+            r["status"] = "Data found ✅"
+        else:
+            r["success"] = False
+            r["status"] = "Data not available 🙅"
+
     elapsed = f"{round(time() - t_start, 1)} seconds"
 
     return Response(
@@ -361,7 +420,10 @@ async def search_parallel(request: Request, req: BatchRequest):
     )
 
 
-# ── Auto-pinger ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUTO-PINGER
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def _pinger():
     port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
@@ -382,7 +444,10 @@ async def _startup():
     asyncio.create_task(_pinger())
 
 
-# ── Gradio UI ───────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════
+#  GRADIO UI
+# ═══════════════════════════════════════════════════════════════════════════
+
 def _format_result(row: dict) -> str:
     lines = []
     for field in SEARCH_FIELDS:
@@ -416,11 +481,12 @@ def _search_ui(query: str, limit: int) -> str:
             f"🔍 **Query:** `{q}`\n"
             f"**Searched:** {searched}\n"
             f"⏱️ **Response:** {elapsed}\n\n"
-            f"❌ **No data found**."
+            f"🙅 **Data not available** — this number is not present in the database."
         )
 
     header = (
         f"🔍 **Query:** `{q}`  |  **Found:** {count}  |  **Searched:** {searched}\n"
+        f"✅ **Data found**\n"
         f"⏱️ **Response:** {elapsed}\n"
         f"👨‍💻 **Developer:** {DEVELOPER}  |  📢 **Channel:** {CHANNEL}\n\n---\n\n"
     )
