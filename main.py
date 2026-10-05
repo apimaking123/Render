@@ -43,11 +43,24 @@ RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 DEVELOPER = "@Cosmos_ownerr"
 CHANNEL = "@cosmosxinfo"
 
+# All searchable columns in the dataset
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
 ]
+
+# Columns that contain phone-like numbers
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
+
+# ✅ Final output format — uppercase with spaces
+FINAL_FIELDS = [
+    ("MOBILE NUMBER",      "phoneNumber"),   # Mobile number
+    ("NAME",               "name"),          # Name
+    ("FATHER NAME",        "fathersName"),   # Father name
+    ("ADDRESS",            "address"),       # Address
+    ("ALTERNATIVE NUMBER", "otherNumber"),   # Alternative number
+    ("AADHAR NUMBER",      "aadharNumber"),  # Aadhar
+]
 
 REMOTE_INDEXES = {
     "phone":  [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet"  for i in range(7)],
@@ -173,7 +186,7 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP
+#  DEDUP + FINAL FORMAT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _person_key(row: dict) -> tuple:
@@ -184,18 +197,22 @@ def _person_key(row: dict) -> tuple:
     return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
 
-def _connected_numbers(row: dict) -> list[dict]:
-    connected, seen = [], set()
-    for field in NUMBER_FIELDS:
-        raw = row.get(field)
-        if raw is None:
+def _finalize_row(row: dict) -> dict:
+    """
+    Build the final simple response row with uppercase field names.
+    Order: MOBILE NUMBER → NAME → FATHER NAME → ADDRESS → ALTERNATIVE NUMBER → AADHAR NUMBER.
+    Skips any field that is empty or null.
+    """
+    out = {}
+    for output_key, source_key in FINAL_FIELDS:
+        val = row.get(source_key)
+        if val is None:
             continue
-        value = str(raw).strip()
-        if not value or value in seen:
+        val = str(val).strip()
+        if not val:
             continue
-        seen.add(value)
-        connected.append({"field": field, "value": value})
-    return connected
+        out[output_key] = val
+    return out
 
 
 def _cap_duplicates(rows: list[dict]) -> list[dict]:
@@ -206,9 +223,7 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
         n = seen.get(k, 0)
         if n < DUPLICATE_CAP:
             seen[k] = n + 1
-            record = dict(r)
-            record["connected_numbers"] = _connected_numbers(record)
-            out.append(record)
+            out.append(_finalize_row(dict(r)))
     return out
 
 
@@ -227,11 +242,11 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         elif field == "aadharNumber" and _idx_ready("aadhar"):
             view = "people_aadhar"
         else:
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+            return {"results": []}
         sql = f"SELECT * FROM {view} WHERE {field} = '{v}' LIMIT {limit * DUPLICATE_CAP + 20}"
     elif mode == "contains":
         if field != "name":
-            return {"field": field, "value": value, "mode": mode, "count": 0, "results": []}
+            return {"results": []}
         v2 = v.replace("%", r"\%").replace("_", r"\_")
         sql = f"SELECT * FROM people_phone WHERE {field} ILIKE '%{v2}%' ESCAPE '\\' LIMIT {limit * DUPLICATE_CAP + 20}"
     else:
@@ -241,7 +256,7 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
     results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
-    return {"field": field, "value": value, "mode": mode, "count": len(results), "results": results}
+    return {"results": results}
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
@@ -252,16 +267,15 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         return cached
 
     if not (q.isdigit() and len(q) >= 8):
-        result = {"query": q, "searched_fields": [], "count": 0, "results": []}
+        result = {"query": q, "results": []}
         _cache_set(cache_key, result)
         return result
 
-    all_rows, searched = [], []
+    all_rows = []
     if _idx_ready("phone"):
         try:
             r = _run_field_search("phoneNumber", q, "exact", limit)
             all_rows.extend(r["results"])
-            searched.append("phoneNumber")
         except Exception as e:
             print(f"[phone error] {e}")
 
@@ -269,15 +283,11 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         try:
             r = _run_field_search("aadharNumber", q, "exact", limit)
             all_rows.extend(r["results"])
-            searched.append("aadharNumber")
         except Exception as e:
             print(f"[aadhar error] {e}")
 
     all_rows = _cap_duplicates(all_rows)[:limit]
-    result = {
-        "query": q, "searched_fields": searched,
-        "count": len(all_rows), "results": all_rows,
-    }
+    result = {"query": q, "results": all_rows}
     _cache_set(cache_key, result)
     return result
 
@@ -346,14 +356,13 @@ async def search(
 
     elapsed = f"{round(time() - t_start, 1)} seconds"
 
-    if data["count"] > 0:
+    if data["results"]:
         result = {
             "success": True,
             "status": "Data found ✅",
             "response_time": elapsed,
-            **data,
-            "number": q_val,
-            "total": data["count"],
+            "query": q_val,
+            "results": data["results"],
             **_credit_block(),
         }
     else:
@@ -362,10 +371,6 @@ async def search(
             "status": "Data not available 🙅",
             "response_time": elapsed,
             "query": q_val,
-            "number": q_val,
-            "searched_fields": data.get("searched_fields", []),
-            "count": 0,
-            "total": 0,
             "results": [],
             **_credit_block(),
         }
@@ -400,7 +405,7 @@ async def search_parallel(request: Request, req: BatchRequest):
     results = await asyncio.gather(*tasks)
 
     for r in results:
-        if r.get("count", 0) > 0:
+        if r.get("results"):
             r["success"] = True
             r["status"] = "Data found ✅"
         else:
@@ -450,14 +455,10 @@ async def _startup():
 
 def _format_result(row: dict) -> str:
     lines = []
-    for field in SEARCH_FIELDS:
-        val = row.get(field, "")
+    for field in ["MOBILE NUMBER", "NAME", "FATHER NAME", "ADDRESS", "ALTERNATIVE NUMBER", "AADHAR NUMBER"]:
+        val = row.get(field)
         if val:
             lines.append(f"**{field}:** {val}")
-    cn = row.get("connected_numbers", [])
-    if cn:
-        nums = ", ".join(f"{c['field']}={c['value']}" for c in cn)
-        lines.append(f"**connected:** {nums}")
     return "\n\n".join(lines)
 
 
@@ -472,20 +473,17 @@ def _search_ui(query: str, limit: int) -> str:
         return f"❌ Error: {str(e)}"
     elapsed = f"{round(time() - t_start, 1)} seconds"
 
-    count = data["count"]
     results = data["results"]
-    searched = ", ".join(data.get("searched_fields", []))
 
     if not results:
         return (
             f"🔍 **Query:** `{q}`\n"
-            f"**Searched:** {searched}\n"
             f"⏱️ **Response:** {elapsed}\n\n"
             f"🙅 **Data not available** — this number is not present in the database."
         )
 
     header = (
-        f"🔍 **Query:** `{q}`  |  **Found:** {count}  |  **Searched:** {searched}\n"
+        f"🔍 **Query:** `{q}`  |  **Found:** {len(results)}\n"
         f"✅ **Data found**\n"
         f"⏱️ **Response:** {elapsed}\n"
         f"👨‍💻 **Developer:** {DEVELOPER}  |  📢 **Channel:** {CHANNEL}\n\n---\n\n"
