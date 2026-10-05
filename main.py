@@ -163,7 +163,10 @@ def _person_key(row: dict) -> tuple:
 
 
 def _finalize_row(row: dict) -> dict:
-    """Build the final row with uppercase labels. Skips nulls/empties."""
+    """
+    Build the final row with uppercase labels.
+    Missing/empty fields are returned as null — never dropped.
+    """
     mapping = [
         ("MOBILE NUMBER",      "phoneNumber"),
         ("NAME",               "name"),
@@ -176,11 +179,10 @@ def _finalize_row(row: dict) -> dict:
     for label, source in mapping:
         v = row.get(source)
         if v is None:
+            out[label] = None
             continue
         v = str(v).strip()
-        if not v:
-            continue
-        out[label] = v
+        out[label] = v if v else None
     return out
 
 
@@ -229,7 +231,7 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
         print(f"[ROW]  {rows[0]}")
 
     raw = [dict(zip(cols, r)) for r in rows]
-    return {"results": raw}   # ← RAW. No dedup. No finalize.
+    return {"results": raw}
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
@@ -259,7 +261,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         except Exception as e:
             print(f"[aadhar error] {e}")
 
-    all_rows = _cap_duplicates(all_rows)[:limit]   # dedup + finalize ONCE
+    all_rows = _cap_duplicates(all_rows)[:limit]
     result = {"query": q, "results": all_rows}
     _cache_set(cache_key, result)
     return result
