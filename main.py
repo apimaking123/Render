@@ -1,9 +1,8 @@
 """
 ICMR + HITEK Search API
 ========================
-A high-performance search API over 2.5 billion Indian citizen records
-(ICMR + HITEK data) using DuckDB reading remote Parquet indexes from
-Hugging Face buckets.
+DuckDB-backed search over 2.5B records.
+Reads remote Parquet indexes from Hugging Face bucket.
 
 Author : @Cosmos_ownerr
 Channel: @cosmosxinfo
@@ -43,13 +42,11 @@ RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 DEVELOPER = "@Cosmos_ownerr"
 CHANNEL = "@cosmosxinfo"
 
-# All searchable columns in the dataset
+# Actual columns in the Parquet files (confirmed from reference main.py)
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
 ]
-
-# Columns that contain phone-like numbers
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
 REMOTE_INDEXES = {
@@ -176,51 +173,40 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP + FINAL FORMAT
+#  DEDUP (uses actual column names)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _person_key(row: dict) -> tuple:
-    """Normalize a row to a person key regardless of column naming."""
-    lower = {str(k).lower(): v for k, v in row.items()}
-
-    def pick(*names):
-        for n in names:
-            v = lower.get(n.lower())
-            if v is not None and str(v).strip():
-                return str(v).strip()
-        return ""
-
-    ph = pick("phonenumber", "phone_number", "phone", "mobile")
-    ad = pick("aadharnumber", "aadhar_number", "aadhar", "aadhaar")
+    ph = (row.get("phoneNumber") or "").strip()
+    ad = (row.get("aadharNumber") or "").strip()
     if ph or ad:
         return (ph, ad)
-    return pick("name"), pick("fathersname", "father_name", "fathername")
+    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
 
 def _finalize_row(row: dict) -> dict:
     """
-    Build the final simple response row — case-insensitive auto-match.
-    Output keys are uppercase with spaces.
+    Build the final simple response row.
+    Order: MOBILE NUMBER → NAME → FATHER NAME → ADDRESS → ALTERNATIVE NUMBER → AADHAR NUMBER.
+    Skips any field that is empty or null.
     """
-    aliases = [
-        ("MOBILE NUMBER",      ["phonenumber", "phone_number", "phone", "mobile"]),
-        ("NAME",               ["name"]),
-        ("FATHER NAME",        ["fathersname", "father_name", "fathername", "father"]),
-        ("ADDRESS",            ["address", "addr"]),
-        ("ALTERNATIVE NUMBER", ["othernumber", "other_number", "alternate_number", "alternate", "other"]),
-        ("AADHAR NUMBER",      ["aadharnumber", "aadhar_number", "aadhar", "aadhaar"]),
+    mapping = [
+        ("MOBILE NUMBER",      "phoneNumber"),
+        ("NAME",               "name"),
+        ("FATHER NAME",        "fathersName"),
+        ("ADDRESS",            "address"),
+        ("ALTERNATIVE NUMBER", "otherNumber"),
+        ("AADHAR NUMBER",      "aadharNumber"),
     ]
-
-    # Normalize DB column names to lowercase for matching
-    lower = {str(k).strip().lower(): v for k, v in row.items()}
-
     out = {}
-    for output_key, candidates in aliases:
-        for candidate in candidates:
-            v = lower.get(candidate.lower())
-            if v is not None and str(v).strip():
-                out[output_key] = str(v).strip()
-                break
+    for output_key, source_key in mapping:
+        val = row.get(source_key)
+        if val is None:
+            continue
+        val = str(val).strip()
+        if not val:
+            continue
+        out[output_key] = val
     return out
 
 
@@ -474,7 +460,7 @@ def _format_result(row: dict) -> str:
 
 def _search_ui(query: str, limit: int) -> str:
     if not query or not query.strip():
-        return "⚠️ Kuch toh search karo — phone, aadhar, ya name daalo."
+        return "⚠️ Kuch toh search karo."
     q = query.strip()
     t_start = time()
     try:
@@ -489,7 +475,7 @@ def _search_ui(query: str, limit: int) -> str:
         return (
             f"🔍 **Query:** `{q}`\n"
             f"⏱️ **Response:** {elapsed}\n\n"
-            f"🙅 **Data not available** — this number is not present in the database."
+            f"🙅 **Data not available**."
         )
 
     header = (
