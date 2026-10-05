@@ -42,7 +42,7 @@ RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 DEVELOPER = "@Cosmos_ownerr"
 CHANNEL = "@cosmosxinfo"
 
-# Actual columns in the Parquet files (confirmed from reference main.py)
+# These are what we EXPECT the Parquet columns to be (from reference main.py)
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
@@ -173,40 +173,54 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP (uses actual column names)
+#  DEDUP + FINAL FORMAT (adaptive to actual columns)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
+    """Try hard to find phone + aadhar in whatever column names exist."""
+    lower = {str(k).lower().strip(): v for k, v in row.items()}
+
+    def pick(*names):
+        for n in names:
+            v = lower.get(n)
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    ph = pick("phonenumber", "phone_number", "phone", "mobile", "mobilenumber")
+    ad = pick("aadharnumber", "aadhar_number", "aadhar", "aadhaar", "aadhaarnumber")
     if ph or ad:
         return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
+    nm = pick("name", "fullname", "full_name")
+    fn = pick("fathersname", "father_name", "fathername", "father")
+    return (nm, fn)
+
+
+# Output labels (what the user sees) → candidate source column names (checked case-insensitive)
+_LABEL_MAP = [
+    ("MOBILE NUMBER",      ["phonenumber", "phone_number", "phone", "mobile"]),
+    ("NAME",               ["name", "fullname", "full_name"]),
+    ("FATHER NAME",        ["fathersname", "father_name", "fathername", "father"]),
+    ("ADDRESS",            ["address", "addr"]),
+    ("ALTERNATIVE NUMBER", ["othernumber", "other_number", "alternate_number", "alternate", "other"]),
+    ("AADHAR NUMBER",      ["aadharnumber", "aadhar_number", "aadhar", "aadhaar", "aadhaarnumber"]),
+]
 
 
 def _finalize_row(row: dict) -> dict:
     """
-    Build the final simple response row.
-    Order: MOBILE NUMBER → NAME → FATHER NAME → ADDRESS → ALTERNATIVE NUMBER → AADHAR NUMBER.
-    Skips any field that is empty or null.
+    Build the final row with uppercase labels.
+    Case-insensitive match against candidate column names.
+    Auto-hides any column we don't know about (district, source, etc.).
     """
-    mapping = [
-        ("MOBILE NUMBER",      "phoneNumber"),
-        ("NAME",               "name"),
-        ("FATHER NAME",        "fathersName"),
-        ("ADDRESS",            "address"),
-        ("ALTERNATIVE NUMBER", "otherNumber"),
-        ("AADHAR NUMBER",      "aadharNumber"),
-    ]
+    lower = {str(k).strip().lower(): v for k, v in row.items()}
     out = {}
-    for output_key, source_key in mapping:
-        val = row.get(source_key)
-        if val is None:
-            continue
-        val = str(val).strip()
-        if not val:
-            continue
-        out[output_key] = val
+    for label, candidates in _LABEL_MAP:
+        for cand in candidates:
+            v = lower.get(cand)
+            if v is not None and str(v).strip():
+                out[label] = str(v).strip()
+                break
     return out
 
 
@@ -250,6 +264,12 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     con = _get_conn()
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
+
+    # 🔍 DEBUG — visible in Render logs
+    print(f"[COLS] {cols}")
+    if rows:
+        print(f"[ROW]  {rows[0]}")
+
     raw = [dict(zip(cols, r)) for r in rows]
     results = _cap_duplicates(raw)[:limit]
     return {"results": results}
