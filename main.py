@@ -38,11 +38,9 @@ THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
 DUPLICATE_CAP = 2
 RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 
-# ✅ YOUR CREDITS
 DEVELOPER = "@Cosmos_ownerr"
 CHANNEL = "@cosmosxinfo"
 
-# These are what we EXPECT the Parquet columns to be (from reference main.py)
 SEARCH_FIELDS = [
     "name", "fathersName", "phoneNumber", "aadharNumber", "otherNumber",
     "address", "district", "pincode", "state", "town", "source",
@@ -55,21 +53,11 @@ REMOTE_INDEXES = {
 }
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CREDITS
-# ═══════════════════════════════════════════════════════════════════════════
-
 def _credit_block() -> dict:
-    return {
-        "developer": DEVELOPER,
-        "channel": CHANNEL,
-    }
+    return {"developer": DEVELOPER, "channel": CHANNEL}
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  IN-MEMORY CACHE
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Cache ───────────────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
 CACHE_MAX = 5000
@@ -88,10 +76,7 @@ def _cache_set(key: str, value: dict):
         _cache[key] = value
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  RATE LIMITER (per IP, 60s sliding window)
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Rate limiter ────────────────────────────────────────────────────────────
 _hits: dict[str, list[float]] = defaultdict(list)
 _hits_lock = threading.Lock()
 
@@ -106,10 +91,7 @@ def _rate_ok(ip: str) -> bool:
         return True
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DUCKDB POOL
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── DuckDB pool ─────────────────────────────────────────────────────────────
 _conns: list[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
@@ -145,10 +127,9 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
             print(f"[HF token secret failed] {e}")
 
     for kind, urls in REMOTE_INDEXES.items():
-        view = f"people_{kind}"
         lst = ", ".join(f"'{u}'" for u in urls)
         con.execute(
-            f"CREATE OR REPLACE VIEW {view} AS "
+            f"CREATE OR REPLACE VIEW people_{kind} AS "
             f"SELECT * FROM read_parquet([{lst}])"
         )
     con.execute(f"SET threads = {THREADS_PER_CONN}")
@@ -172,59 +153,39 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP + FINAL FORMAT (adaptive to actual columns)
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Dedup + Final format ────────────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
-    """Try hard to find phone + aadhar in whatever column names exist."""
-    lower = {str(k).lower().strip(): v for k, v in row.items()}
-
-    def pick(*names):
-        for n in names:
-            v = lower.get(n)
-            if v is not None and str(v).strip():
-                return str(v).strip()
-        return ""
-
-    ph = pick("phonenumber", "phone_number", "phone", "mobile", "mobilenumber")
-    ad = pick("aadharnumber", "aadhar_number", "aadhar", "aadhaar", "aadhaarnumber")
+    ph = (row.get("phoneNumber") or "").strip()
+    ad = (row.get("aadharNumber") or "").strip()
     if ph or ad:
         return (ph, ad)
-    nm = pick("name", "fullname", "full_name")
-    fn = pick("fathersname", "father_name", "fathername", "father")
-    return (nm, fn)
-
-
-# Output labels (what the user sees) → candidate source column names (checked case-insensitive)
-_LABEL_MAP = [
-    ("MOBILE NUMBER",      ["phonenumber", "phone_number", "phone", "mobile"]),
-    ("NAME",               ["name", "fullname", "full_name"]),
-    ("FATHER NAME",        ["fathersname", "father_name", "fathername", "father"]),
-    ("ADDRESS",            ["address", "addr"]),
-    ("ALTERNATIVE NUMBER", ["othernumber", "other_number", "alternate_number", "alternate", "other"]),
-    ("AADHAR NUMBER",      ["aadharnumber", "aadhar_number", "aadhar", "aadhaar", "aadhaarnumber"]),
-]
+    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
 
 
 def _finalize_row(row: dict) -> dict:
-    """
-    Build the final row with uppercase labels.
-    Case-insensitive match against candidate column names.
-    Auto-hides any column we don't know about (district, source, etc.).
-    """
-    lower = {str(k).strip().lower(): v for k, v in row.items()}
+    """Build the final row with uppercase labels. Skips nulls/empties."""
+    mapping = [
+        ("MOBILE NUMBER",      "phoneNumber"),
+        ("NAME",               "name"),
+        ("FATHER NAME",        "fathersName"),
+        ("ADDRESS",            "address"),
+        ("ALTERNATIVE NUMBER", "otherNumber"),
+        ("AADHAR NUMBER",      "aadharNumber"),
+    ]
     out = {}
-    for label, candidates in _LABEL_MAP:
-        for cand in candidates:
-            v = lower.get(cand)
-            if v is not None and str(v).strip():
-                out[label] = str(v).strip()
-                break
+    for label, source in mapping:
+        v = row.get(source)
+        if v is None:
+            continue
+        v = str(v).strip()
+        if not v:
+            continue
+        out[label] = v
     return out
 
 
 def _cap_duplicates(rows: list[dict]) -> list[dict]:
+    """Dedup, then finalize. Called ONCE per query."""
     seen: dict[tuple, int] = {}
     out = []
     for r in rows:
@@ -232,15 +193,13 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
         n = seen.get(k, 0)
         if n < DUPLICATE_CAP:
             seen[k] = n + 1
-            out.append(_finalize_row(dict(r)))
+            out.append(_finalize_row(r))
     return out
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SEARCH
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Search ──────────────────────────────────────────────────────────────────
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
+    """Return RAW rows (no dedup, no finalize) — caller handles that."""
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
     v = value.replace("'", "''")
@@ -265,14 +224,12 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
 
-    # 🔍 DEBUG — visible in Render logs
     print(f"[COLS] {cols}")
     if rows:
         print(f"[ROW]  {rows[0]}")
 
     raw = [dict(zip(cols, r)) for r in rows]
-    results = _cap_duplicates(raw)[:limit]
-    return {"results": results}
+    return {"results": raw}   # ← RAW. No dedup. No finalize.
 
 
 def _unified_search(q: str, limit: int = 10) -> dict:
@@ -287,7 +244,7 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         _cache_set(cache_key, result)
         return result
 
-    all_rows = []
+    all_rows: list[dict] = []
     if _idx_ready("phone"):
         try:
             r = _run_field_search("phoneNumber", q, "exact", limit)
@@ -302,16 +259,13 @@ def _unified_search(q: str, limit: int = 10) -> dict:
         except Exception as e:
             print(f"[aadhar error] {e}")
 
-    all_rows = _cap_duplicates(all_rows)[:limit]
+    all_rows = _cap_duplicates(all_rows)[:limit]   # dedup + finalize ONCE
     result = {"query": q, "results": all_rows}
     _cache_set(cache_key, result)
     return result
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  FASTAPI
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── FastAPI ─────────────────────────────────────────────────────────────────
 fastapi_app = FastAPI(title="ICMR + HITEK Search API")
 
 
@@ -367,6 +321,7 @@ async def search(
     loop = asyncio.get_running_loop()
     if field:
         data = await loop.run_in_executor(pool, _run_field_search, field, q_val, mode, limit)
+        data["results"] = _cap_duplicates(data["results"])[:limit]
     else:
         data = await loop.run_in_executor(pool, _unified_search, q_val, limit)
 
@@ -398,7 +353,6 @@ async def search(
 @fastapi_app.post("/search/parallel")
 async def search_parallel(request: Request, req: BatchRequest):
     t_start = time()
-
     ip = request.client.host if request.client else "unknown"
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
@@ -418,33 +372,30 @@ async def search_parallel(request: Request, req: BatchRequest):
         )
         for item in req.queries
     ]
-    results = await asyncio.gather(*tasks)
+    raw_results = await asyncio.gather(*tasks)
 
-    for r in results:
-        if r.get("results"):
-            r["success"] = True
-            r["status"] = "Data found ✅"
-        else:
-            r["success"] = False
-            r["status"] = "Data not available 🙅"
+    results = []
+    for r in raw_results:
+        finalized = _cap_duplicates(r.get("results", []))[:req.limit]
+        results.append({
+            "success": bool(finalized),
+            "status": "Data found ✅" if finalized else "Data not available 🙅",
+            "results": finalized,
+        })
 
     elapsed = f"{round(time() - t_start, 1)} seconds"
-
     return Response(
         content=json.dumps({
             "searches": len(req.queries),
             "response_time": elapsed,
-            "results": list(results),
+            "results": results,
             **_credit_block(),
         }, indent=2, ensure_ascii=False),
         media_type="application/json",
     )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  AUTO-PINGER
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Auto-pinger ─────────────────────────────────────────────────────────────
 async def _pinger():
     port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
@@ -465,10 +416,7 @@ async def _startup():
     asyncio.create_task(_pinger())
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  GRADIO UI
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── Gradio UI ───────────────────────────────────────────────────────────────
 def _format_result(row: dict) -> str:
     lines = []
     for field in ["MOBILE NUMBER", "NAME", "FATHER NAME", "ADDRESS", "ALTERNATIVE NUMBER", "AADHAR NUMBER"]:
@@ -490,7 +438,6 @@ def _search_ui(query: str, limit: int) -> str:
     elapsed = f"{round(time() - t_start, 1)} seconds"
 
     results = data["results"]
-
     if not results:
         return (
             f"🔍 **Query:** `{q}`\n"
