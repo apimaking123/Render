@@ -52,16 +52,6 @@ SEARCH_FIELDS = [
 # Columns that contain phone-like numbers
 NUMBER_FIELDS = ["phoneNumber", "aadharNumber", "otherNumber"]
 
-# ✅ Final output format — uppercase with spaces
-FINAL_FIELDS = [
-    ("MOBILE NUMBER",      "phoneNumber"),   # Mobile number
-    ("NAME",               "name"),          # Name
-    ("FATHER NAME",        "fathersName"),   # Father name
-    ("ADDRESS",            "address"),       # Address
-    ("ALTERNATIVE NUMBER", "otherNumber"),   # Alternative number
-    ("AADHAR NUMBER",      "aadharNumber"),  # Aadhar
-]
-
 REMOTE_INDEXES = {
     "phone":  [f"{HF_INDEX_BASE}/idx_phone.{i}.parquet"  for i in range(7)],
     "aadhar": [f"{HF_INDEX_BASE}/idx_aadhar.{i}.parquet" for i in range(7)],
@@ -186,32 +176,54 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP + FINAL FORMAT
+#  DEDUP + FINAL FORMAT (auto-detects field names)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _person_key(row: dict) -> tuple:
-    ph = (row.get("phoneNumber") or "").strip()
-    ad = (row.get("aadharNumber") or "").strip()
+    """Normalize a row to a person key regardless of column naming."""
+    lower = {str(k).lower(): v for k, v in row.items()}
+
+    def pick(*names):
+        for n in names:
+            v = lower.get(n.lower())
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        return ""
+
+    ph = pick("phoneNumber", "phone", "mobile")
+    ad = pick("aadharNumber", "aadhar", "aadhaar")
     if ph or ad:
         return (ph, ad)
-    return (row.get("name") or "").strip(), (row.get("fathersName") or "").strip()
+    return pick("name"), pick("fathersName", "fathername", "father_name")
 
 
 def _finalize_row(row: dict) -> dict:
     """
-    Build the final simple response row with uppercase field names.
-    Order: MOBILE NUMBER → NAME → FATHER NAME → ADDRESS → ALTERNATIVE NUMBER → AADHAR NUMBER.
-    Skips any field that is empty or null.
+    Build the final simple response row — case-insensitive.
+    Auto-matches any variant of the input field names.
     """
+    aliases = [
+        ("MOBILE NUMBER",      ["phoneNumber", "phone", "mobile", "mobilenumber"]),
+        ("NAME",               ["name", "fullname", "full_name"]),
+        ("FATHER NAME",        ["fathersName", "fathername", "father_name", "father"]),
+        ("ADDRESS",            ["address", "addr"]),
+        ("ALTERNATIVE NUMBER", ["otherNumber", "alternateNumber", "alternate", "other", "alt_number"]),
+        ("AADHAR NUMBER",      ["aadharNumber", "aadhar", "aadhaar", "aadhaarnumber"]),
+    ]
+
+    # Normalize input keys to lowercase for matching
+    lower = {str(k).strip().lower(): v for k, v in row.items()}
+
     out = {}
-    for output_key, source_key in FINAL_FIELDS:
-        val = row.get(source_key)
-        if val is None:
-            continue
-        val = str(val).strip()
-        if not val:
-            continue
-        out[output_key] = val
+    for output_key, candidates in aliases:
+        val = None
+        for candidate in candidates:
+            v = lower.get(candidate.lower())
+            if v is not None and str(v).strip():
+                val = str(v).strip()
+                break
+        if val:
+            out[output_key] = val
     return out
 
 
@@ -255,7 +267,8 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     con = _get_conn()
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
-    results = _cap_duplicates([dict(zip(cols, r)) for r in rows])[:limit]
+    raw = [dict(zip(cols, r)) for r in rows]
+    results = _cap_duplicates(raw)[:limit]
     return {"results": results}
 
 
