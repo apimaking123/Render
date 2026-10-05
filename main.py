@@ -176,7 +176,7 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  DEDUP + FINAL FORMAT (auto-detects field names)
+#  DEDUP + FINAL FORMAT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _person_key(row: dict) -> tuple:
@@ -190,40 +190,37 @@ def _person_key(row: dict) -> tuple:
                 return str(v).strip()
         return ""
 
-    ph = pick("phoneNumber", "phone", "mobile")
-    ad = pick("aadharNumber", "aadhar", "aadhaar")
+    ph = pick("phonenumber", "phone_number", "phone", "mobile")
+    ad = pick("aadharnumber", "aadhar_number", "aadhar", "aadhaar")
     if ph or ad:
         return (ph, ad)
-    return pick("name"), pick("fathersName", "fathername", "father_name")
+    return pick("name"), pick("fathersname", "father_name", "fathername")
 
 
 def _finalize_row(row: dict) -> dict:
     """
-    Build the final simple response row — case-insensitive.
-    Auto-matches any variant of the input field names.
+    Build the final simple response row — case-insensitive auto-match.
+    Output keys are uppercase with spaces.
     """
     aliases = [
-        ("MOBILE NUMBER",      ["phoneNumber", "phone", "mobile", "mobilenumber"]),
-        ("NAME",               ["name", "fullname", "full_name"]),
-        ("FATHER NAME",        ["fathersName", "fathername", "father_name", "father"]),
+        ("MOBILE NUMBER",      ["phonenumber", "phone_number", "phone", "mobile"]),
+        ("NAME",               ["name"]),
+        ("FATHER NAME",        ["fathersname", "father_name", "fathername", "father"]),
         ("ADDRESS",            ["address", "addr"]),
-        ("ALTERNATIVE NUMBER", ["otherNumber", "alternateNumber", "alternate", "other", "alt_number"]),
-        ("AADHAR NUMBER",      ["aadharNumber", "aadhar", "aadhaar", "aadhaarnumber"]),
+        ("ALTERNATIVE NUMBER", ["othernumber", "other_number", "alternate_number", "alternate", "other"]),
+        ("AADHAR NUMBER",      ["aadharnumber", "aadhar_number", "aadhar", "aadhaar"]),
     ]
 
-    # Normalize input keys to lowercase for matching
+    # Normalize DB column names to lowercase for matching
     lower = {str(k).strip().lower(): v for k, v in row.items()}
 
     out = {}
     for output_key, candidates in aliases:
-        val = None
         for candidate in candidates:
             v = lower.get(candidate.lower())
             if v is not None and str(v).strip():
-                val = str(v).strip()
+                out[output_key] = str(v).strip()
                 break
-        if val:
-            out[output_key] = val
     return out
 
 
