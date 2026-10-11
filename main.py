@@ -1,11 +1,7 @@
 """
 ICMR + HITEK Search API
-========================
 DuckDB-backed search over 2.5B records.
-Reads remote Parquet indexes from Hugging Face bucket.
-
-Author : @Cosmos_ownerr
-Channel: @cosmosxinfo
+Author : @Cosmos_ownerr | Channel: @cosmosxinfo
 """
 
 import asyncio
@@ -23,18 +19,15 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from pydantic import BaseModel
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  CONFIG
-# ═══════════════════════════════════════════════════════════════════════════
-
+# ── CONFIG ──────────────────────────────────────────────────────────────────
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
     "https://huggingface.co/buckets/Apimaking/icrm-hitek-full-db-mixed-bucket-new/resolve",
 ).rstrip("/")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
-THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "2"))
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "4"))
+THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "8"))
 DUPLICATE_CAP = 2
 RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
 
@@ -57,15 +50,9 @@ def _credit_block() -> dict:
     return {"developer": DEVELOPER, "channel": CHANNEL}
 
 
-# ── Client IP helper (works behind Nginx) ───────────────────────────────────
 def _client_ip(request: Request) -> str:
-    """
-    Get the real client IP even when running behind a reverse proxy (Nginx).
-    Falls back to direct socket IP if no forwarded header present.
-    """
     forwarded = request.headers.get("X-Forwarded-For", "").strip()
     if forwarded:
-        # X-Forwarded-For can be "client, proxy1, proxy2" — take the first
         return forwarded.split(",")[0].strip()
     real_ip = request.headers.get("X-Real-IP", "").strip()
     if real_ip:
@@ -129,9 +116,15 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
         con.execute("LOAD parquet;")
         con.execute("LOAD httpfs;")
 
+    # Performance settings for remote Parquet over HTTP
     con.execute("SET enable_http_metadata_cache=true")
     con.execute("SET enable_object_cache=true")
     con.execute("SET prefetch_all_parquet_files=true")
+    con.execute("SET http_keep_alive=true")
+    con.execute("SET http_timeout=300000")
+    con.execute("SET http_retries=5")
+    con.execute("SET threads=8")
+    con.execute("SET memory_limit='4GB'")
 
     if HF_TOKEN:
         try:
@@ -148,7 +141,6 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
             f"CREATE OR REPLACE VIEW people_{kind} AS "
             f"SELECT * FROM read_parquet([{lst}])"
         )
-    con.execute(f"SET threads = {THREADS_PER_CONN}")
     return con
 
 
@@ -169,6 +161,20 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
+# ── Warmup ──────────────────────────────────────────────────────────────────
+def _warmup():
+    """Touch both views at startup so Parquet metadata is cached permanently."""
+    try:
+        con = _get_conn()
+        print("[warmup] loading phone index metadata...")
+        con.execute("SELECT COUNT(*) FROM people_phone LIMIT 1").fetchone()
+        print("[warmup] loading aadhar index metadata...")
+        con.execute("SELECT COUNT(*) FROM people_aadhar LIMIT 1").fetchone()
+        print("[warmup] DuckDB ready — metadata cached")
+    except Exception as e:
+        print(f"[warmup error] {e}")
+
+
 # ── Dedup + Final format ────────────────────────────────────────────────────
 def _person_key(row: dict) -> tuple:
     ph = (row.get("phoneNumber") or "").strip()
@@ -179,10 +185,6 @@ def _person_key(row: dict) -> tuple:
 
 
 def _finalize_row(row: dict) -> dict:
-    """
-    Build the final row with uppercase labels.
-    Missing/empty fields are returned as null — never dropped.
-    """
     mapping = [
         ("MOBILE NUMBER",      "phoneNumber"),
         ("NAME",               "name"),
@@ -203,7 +205,6 @@ def _finalize_row(row: dict) -> dict:
 
 
 def _cap_duplicates(rows: list[dict]) -> list[dict]:
-    """Dedup, then finalize. Called ONCE per query."""
     seen: dict[tuple, int] = {}
     out = []
     for r in rows:
@@ -217,7 +218,6 @@ def _cap_duplicates(rows: list[dict]) -> list[dict]:
 
 # ── Search ──────────────────────────────────────────────────────────────────
 def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
-    """Return RAW rows (no dedup, no finalize) — caller handles that."""
     if field not in SEARCH_FIELDS:
         raise ValueError(f"Unknown field: {field}")
     v = value.replace("'", "''")
@@ -432,6 +432,8 @@ async def _pinger():
 @fastapi_app.on_event("startup")
 async def _startup():
     asyncio.create_task(_pinger())
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(pool, _warmup)
 
 
 # ── Gradio UI ───────────────────────────────────────────────────────────────
