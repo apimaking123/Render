@@ -26,7 +26,7 @@ HF_INDEX_BASE = os.environ.get(
 ).rstrip("/")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
-PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "4"))
+PARALLELISM = int(os.environ.get("ICMR_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("ICMR_THREADS_PER_CONN", "8"))
 DUPLICATE_CAP = 2
 RATE_LIMIT_PER_MIN = int(os.environ.get("ICMR_RATE_LIMIT", "20"))
@@ -94,10 +94,9 @@ def _rate_ok(ip: str) -> bool:
         return True
 
 
-# ── DuckDB pool ─────────────────────────────────────────────────────────────
-_conns: list[duckdb.DuckDBPyConnection] = []
-_conns_lock = threading.Lock()
-_thread_local = threading.local()
+# ── DuckDB persistent connection ────────────────────────────────────────────
+_main_conn: duckdb.DuckDBPyConnection | None = None
+_main_lock = threading.Lock()
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 
 
@@ -107,8 +106,8 @@ def _idx_ready(kind: str) -> bool:
 
 def _new_conn() -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
-    con.execute("SET home_directory='/tmp'")
-    con.execute("SET extension_directory='/tmp/duckdb_extensions'")
+    con.execute("SET home_directory='/opt/Render/.duckdb_cache'")
+    con.execute("SET extension_directory='/opt/Render/.duckdb_cache/ext'")
     try:
         con.execute("INSTALL parquet; LOAD parquet;")
         con.execute("INSTALL httpfs;  LOAD httpfs;")
@@ -116,7 +115,6 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
         con.execute("LOAD parquet;")
         con.execute("LOAD httpfs;")
 
-    # Performance settings for remote Parquet over HTTP
     con.execute("SET enable_http_metadata_cache=true")
     con.execute("SET enable_object_cache=true")
     con.execute("SET prefetch_all_parquet_files=true")
@@ -144,33 +142,26 @@ def _new_conn() -> duckdb.DuckDBPyConnection:
     return con
 
 
-def _thread_id() -> int:
-    tid = getattr(_thread_local, "id", None)
-    if tid is None:
-        with _conns_lock:
-            tid = len(_conns)
-            _thread_local.id = tid
-    return tid
-
-
-def _get_conn() -> duckdb.DuckDBPyConnection:
-    ident = _thread_id()
-    with _conns_lock:
-        while len(_conns) <= ident:
-            _conns.append(_new_conn())
-    return _conns[ident]
+def _get_main_conn() -> duckdb.DuckDBPyConnection:
+    global _main_conn
+    if _main_conn is None:
+        with _main_lock:
+            if _main_conn is None:
+                _main_conn = _new_conn()
+                print("[main_conn] persistent connection created")
+    return _main_conn
 
 
 # ── Warmup ──────────────────────────────────────────────────────────────────
 def _warmup():
-    """Touch both views at startup so Parquet metadata is cached permanently."""
+    """Pre-load Parquet metadata into the persistent connection."""
     try:
-        con = _get_conn()
-        print("[warmup] loading phone index metadata...")
+        con = _get_main_conn()
+        print("[warmup] loading phone index...")
         con.execute("SELECT COUNT(*) FROM people_phone LIMIT 1").fetchone()
-        print("[warmup] loading aadhar index metadata...")
+        print("[warmup] loading aadhar index...")
         con.execute("SELECT COUNT(*) FROM people_aadhar LIMIT 1").fetchone()
-        print("[warmup] DuckDB ready — metadata cached")
+        print("[warmup] ✅ DuckDB ready — metadata cached in RAM")
     except Exception as e:
         print(f"[warmup error] {e}")
 
@@ -238,14 +229,9 @@ def _run_field_search(field: str, value: str, mode: str, limit: int) -> dict:
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
-    con = _get_conn()
+    con = _get_main_conn()
     rows = con.execute(sql).fetchall()
     cols = [d[0] for d in con.description]
-
-    print(f"[COLS] {cols}")
-    if rows:
-        print(f"[ROW]  {rows[0]}")
-
     raw = [dict(zip(cols, r)) for r in rows]
     return {"results": raw}
 
@@ -312,6 +298,7 @@ def health():
         "indexes": {"phone": _idx_ready("phone"), "aadhar": _idx_ready("aadhar")},
         "cache_size": len(_cache),
         "hf_token": bool(HF_TOKEN),
+        "warmup_done": _main_conn is not None,
         **_credit_block(),
     }
 
