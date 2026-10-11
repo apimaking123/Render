@@ -57,6 +57,22 @@ def _credit_block() -> dict:
     return {"developer": DEVELOPER, "channel": CHANNEL}
 
 
+# ── Client IP helper (works behind Nginx) ───────────────────────────────────
+def _client_ip(request: Request) -> str:
+    """
+    Get the real client IP even when running behind a reverse proxy (Nginx).
+    Falls back to direct socket IP if no forwarded header present.
+    """
+    forwarded = request.headers.get("X-Forwarded-For", "").strip()
+    if forwarded:
+        # X-Forwarded-For can be "client, proxy1, proxy2" — take the first
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+    return request.client.host if request.client else "unknown"
+
+
 # ── Cache ───────────────────────────────────────────────────────────────────
 _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
@@ -312,7 +328,7 @@ async def search(
 ):
     t_start = time()
 
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
 
@@ -355,7 +371,7 @@ async def search(
 @fastapi_app.post("/search/parallel")
 async def search_parallel(request: Request, req: BatchRequest):
     t_start = time()
-    ip = request.client.host if request.client else "unknown"
+    ip = _client_ip(request)
     if not _rate_ok(ip):
         raise HTTPException(429, f"Rate limit: {RATE_LIMIT_PER_MIN} requests/minute per IP")
     if not req.queries:
