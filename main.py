@@ -22,7 +22,7 @@ from pydantic import BaseModel
 # ── CONFIG ──────────────────────────────────────────────────────────────────
 HF_INDEX_BASE = os.environ.get(
     "ICMR_HF_INDEX_BASE",
-    "https://huggingface.co/buckets/Apimaking/icrm-hitek-full-db-mixed-bucket-new/resolve",
+    "https://huggingface.co/buckets/Apimaking/hardhackar009-full/resolve",
 ).rstrip("/")
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
